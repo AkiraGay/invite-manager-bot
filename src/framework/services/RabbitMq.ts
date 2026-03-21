@@ -551,6 +551,7 @@ export class RabbitMqService extends IMService {
 	}
 
 	public async sendStatusToManager(err?: Error, requestId?: string) {
+		const gatewayStatus = this.client.getGatewayStatusDetails();
 		const payload = {
 			state: this.waitingForTicket
 				? 'waiting'
@@ -561,6 +562,10 @@ export class RabbitMqService extends IMService {
 						: 'running',
 			startedAt: this.client.startedAt?.toString(),
 			gateway: this.client.gatewayConnected,
+			wsStatus: gatewayStatus.wsStatus,
+			invalidSessionCount: gatewayStatus.invalidSessionCount,
+			invalidSessionBackoffMs: gatewayStatus.invalidSessionBackoffMs,
+			invalidSessionActive: gatewayStatus.invalidSessionActive,
 			guilds: this.client.guilds.size,
 			error: err ? err.message : null,
 			build: this.client.build,

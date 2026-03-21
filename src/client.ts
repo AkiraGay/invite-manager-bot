@@ -706,6 +706,26 @@ export class IMClient extends Client {
 		this.lastInvalidSessionAt = now;
 	}
 
+	public getGatewayStatusDetails(): {
+		wsStatus: string | null;
+		invalidSessionCount: number;
+		invalidSessionBackoffMs: number;
+		invalidSessionActive: boolean;
+	} {
+		const shard = this.shards.get(this.shardId - 1) as { status?: string } | undefined;
+		const wsStatus = shard?.status ? String(shard.status).toLowerCase() : null;
+		return {
+			wsStatus,
+			invalidSessionCount: this.invalidSessionCount,
+			invalidSessionBackoffMs: this.getInvalidSessionBackoffMs(),
+			invalidSessionActive: this.hasActiveInvalidSessionWindow()
+		};
+	}
+
+	private hasActiveInvalidSessionWindow(now: number = Date.now()): boolean {
+		return Boolean(this.lastInvalidSessionAt && now - this.lastInvalidSessionAt <= 120000);
+	}
+
 	private getInvalidSessionBackoffMs(): number {
 		if (!this.invalidSessionCount || !this.lastInvalidSessionAt) {
 			return 0;
