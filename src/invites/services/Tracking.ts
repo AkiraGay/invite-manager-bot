@@ -79,6 +79,7 @@ interface InviteSyncResult {
 const GUILDS_IN_PARALLEL = 5;
 const INVITE_CREATE = 40;
 const INVITE_CODES_BATCH_SIZE_DEFAULT = 250;
+const JOIN_EXACT_MATCH_CODE_DB_LIMIT = 32;
 
 function splitInviteCodeBatches<T>(items: T[], batchSize: number): T[][] {
 	if (items.length === 0) {
@@ -121,9 +122,27 @@ function buildInviteCodesToSave(
 		}));
 }
 
+function isJoinExactMatchCodeTooLongError(error: unknown): boolean {
+	if (!error || typeof error !== 'object') {
+		return false;
+	}
+
+	const dbError = error as {
+		code?: string;
+		errno?: number;
+		sqlMessage?: string;
+	};
+	return (
+		(dbError.code === 'ER_DATA_TOO_LONG' || dbError.errno === 1406) &&
+		typeof dbError.sqlMessage === 'string' &&
+		dbError.sqlMessage.includes("'exactMatchCode'")
+	);
+}
+
 export const __test__ = {
 	buildInviteCodesToSave,
-	splitInviteCodeBatches
+	splitInviteCodeBatches,
+	isJoinExactMatchCodeTooLongError
 };
 
 export class TrackingService extends IMService {
@@ -794,14 +813,26 @@ export class TrackingService extends IMService {
 		// Insert the join
 		let joinId: number = null;
 		if (exactMatchCode) {
-			joinId = await this.client.db.saveJoin({
-				exactMatchCode: exactMatchCode,
-				memberId: member.id,
-				guildId: guild.id,
-				createdAt: new Date(member.joinedAt),
-				invalidatedReason: null,
-				cleared: false
-			});
+			try {
+				joinId = await this.client.db.saveJoin({
+					exactMatchCode: exactMatchCode,
+					memberId: member.id,
+					guildId: guild.id,
+					createdAt: new Date(member.joinedAt),
+					invalidatedReason: null,
+					cleared: false
+				});
+			} catch (error) {
+				if (!isJoinExactMatchCodeTooLongError(error)) {
+					throw error;
+				}
+
+				console.log(
+					`Skipping join save because exactMatchCode exceeds DB limit ` +
+						`(guild=${guild.id}, member=${member.id}, length=${exactMatchCode.length}, ` +
+						`limit=${JOIN_EXACT_MATCH_CODE_DB_LIMIT}, code=${exactMatchCode})`
+				);
+			}
 		}
 
 		const lang = sets.lang;
