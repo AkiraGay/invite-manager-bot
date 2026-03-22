@@ -19,6 +19,14 @@ interface ShardMessage {
 	[x: string]: any;
 }
 
+function shouldWaitForStartupDone(clientHasStarted: boolean, startupDoneSatisfied: boolean): boolean {
+	return !clientHasStarted && !startupDoneSatisfied;
+}
+
+export const __test__ = {
+	shouldWaitForStartupDone
+};
+
 export class RabbitMqService extends IMService {
 	private conn: ChannelModel;
 	private connRetry: number = 0;
@@ -33,7 +41,9 @@ export class RabbitMqService extends IMService {
 	private channelStartupDone: Channel;
 	private startupDoneTicket: MQMessage;
 	private waitingForStartupDone: boolean;
+	private startupDoneSatisfied: boolean;
 	private startupDoneRetry: number = 0;
+	private startupDoneRetryTimer: NodeJS.Timeout | null = null;
 
 	private qNameInviteSync: string;
 	private channelInviteSync: Channel;
@@ -234,6 +244,12 @@ export class RabbitMqService extends IMService {
 		this.startupDoneTicket = null;
 		this.waitingForStartupDone = false;
 	}
+	private clearStartupDoneRetryTimer() {
+		if (this.startupDoneRetryTimer) {
+			clearTimeout(this.startupDoneRetryTimer);
+			this.startupDoneRetryTimer = null;
+		}
+	}
 
 	public async waitForStartupTicket() {
 		const { enabled } = this.getStartupTicketSettings();
@@ -305,6 +321,12 @@ export class RabbitMqService extends IMService {
 		});
 	}
 	public async waitForStartupTicketsDone() {
+		if (!shouldWaitForStartupDone(this.client.hasStarted, this.startupDoneSatisfied)) {
+			return;
+		}
+		if (this.waitingForStartupDone || this.channelStartupDone) {
+			return;
+		}
 		const { enabled } = this.getStartupTicketSettings();
 		if (
 			!enabled &&
@@ -326,7 +348,8 @@ export class RabbitMqService extends IMService {
 		this.channelStartupDone.on('close', async (err) => {
 			this.waitingForStartupDone = false;
 
-			if (this.startupDoneTicket) {
+			if (this.startupDoneTicket || !shouldWaitForStartupDone(this.client.hasStarted, this.startupDoneSatisfied)) {
+				this.clearStartupDoneRetryTimer();
 				return;
 			}
 
@@ -338,7 +361,14 @@ export class RabbitMqService extends IMService {
 			console.error('Could not acquire startup done ticket, retrying');
 			const delay = this.getReconnectDelayMs(this.startupDoneRetry, 1000, 30000);
 			this.startupDoneRetry++;
-			setTimeout(() => {
+			if (this.startupDoneRetryTimer) {
+				return;
+			}
+			this.startupDoneRetryTimer = setTimeout(() => {
+				this.startupDoneRetryTimer = null;
+				if (!shouldWaitForStartupDone(this.client.hasStarted, this.startupDoneSatisfied)) {
+					return;
+				}
 				this.waitForStartupTicketsDone().catch((retryErr) => console.error(retryErr));
 			}, delay);
 		});
@@ -358,6 +388,8 @@ export class RabbitMqService extends IMService {
 					}
 					console.log(chalk.green('Acquired startup done ticket!'));
 					this.waitingForStartupDone = false;
+					this.clearStartupDoneRetryTimer();
+					this.startupDoneSatisfied = true;
 					this.startupDoneTicket = msg;
 					this.startupDoneRetry = 0;
 					this.channelStartupDone.ack(msg);
