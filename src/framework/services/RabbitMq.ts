@@ -23,8 +23,13 @@ function shouldWaitForStartupDone(clientHasStarted: boolean, startupDoneSatisfie
 	return !clientHasStarted && !startupDoneSatisfied;
 }
 
+function shouldReuseInviteSyncWait(hasTicket: boolean, hasChannel: boolean, hasWaitPromise: boolean): boolean {
+	return (hasTicket && hasChannel) || hasWaitPromise;
+}
+
 export const __test__ = {
-	shouldWaitForStartupDone
+	shouldWaitForStartupDone,
+	shouldReuseInviteSyncWait
 };
 
 export class RabbitMqService extends IMService {
@@ -51,6 +56,9 @@ export class RabbitMqService extends IMService {
 	private waitingForInviteSyncTicket: boolean;
 	private inviteSyncSeeded: boolean;
 	private inviteSyncRetry: number = 0;
+	private inviteSyncRetryTimer: NodeJS.Timeout | null = null;
+	private inviteSyncWaitPromise: Promise<void> | null = null;
+	private closingInviteSyncChannel: boolean = false;
 
 	private qName: string;
 	private channel: Channel;
@@ -216,9 +224,11 @@ export class RabbitMqService extends IMService {
 			} catch {
 				// NO-OP
 			}
-
-			this.channelInviteSync = null;
 		}
+		this.channelInviteSync = null;
+		this.waitingForInviteSyncTicket = false;
+		this.inviteSyncWaitPromise = null;
+		this.closingInviteSyncChannel = false;
 	}
 	private async shutdownStartupChannel() {
 		if (this.channelStartup) {
@@ -248,6 +258,12 @@ export class RabbitMqService extends IMService {
 		if (this.startupDoneRetryTimer) {
 			clearTimeout(this.startupDoneRetryTimer);
 			this.startupDoneRetryTimer = null;
+		}
+	}
+	private clearInviteSyncRetryTimer() {
+		if (this.inviteSyncRetryTimer) {
+			clearTimeout(this.inviteSyncRetryTimer);
+			this.inviteSyncRetryTimer = null;
 		}
 	}
 
@@ -482,34 +498,51 @@ export class RabbitMqService extends IMService {
 	}
 
 	public async waitForInviteSyncTicket() {
-		if (!this.conn) {
-			console.log(chalk.yellow('No connection available, invite sync tickets disabled.'));
-			return;
-		}
-
 		const { globalMaxConcurrent } = this.getInviteSyncSettings();
 		if (globalMaxConcurrent <= 0) {
 			return;
+		}
+		if (!this.conn) {
+			console.log(chalk.yellow('RabbitMQ not connected, waiting for invite sync ticket...'));
+			await this.waitForConnection();
+		}
+		if (shouldReuseInviteSyncWait(!!this.inviteSyncTicket, !!this.channelInviteSync, !!this.inviteSyncWaitPromise)) {
+			return this.inviteSyncWaitPromise;
+		}
+		if (this.channelInviteSync) {
+			await this.shutdownInviteSyncChannel();
 		}
 
 		this.qNameInviteSync = this.getInviteSyncQueueName();
 		this.channelInviteSync = await this.conn.createChannel();
 		this.channelInviteSync.on('close', async (err) => {
+			const intentionalClose = this.closingInviteSyncChannel;
+			const hadTicket = !!this.inviteSyncTicket;
+			this.closingInviteSyncChannel = false;
+			this.channelInviteSync = null;
 			this.waitingForInviteSyncTicket = false;
+			this.inviteSyncWaitPromise = null;
 
-			if (this.inviteSyncTicket) {
+			if (intentionalClose) {
+				this.inviteSyncTicket = null;
+				this.clearInviteSyncRetryTimer();
 				return;
 			}
+			this.inviteSyncTicket = null;
 
 			if (err) {
 				captureException(err);
 				console.error(err);
 			}
 
-			console.error('Could not acquire invite sync ticket, retrying');
+			console.error(hadTicket ? 'Lost invite sync ticket lease, reacquiring' : 'Could not acquire invite sync ticket, retrying');
 			const delay = this.getReconnectDelayMs(this.inviteSyncRetry, 1000, 30000);
 			this.inviteSyncRetry++;
-			setTimeout(() => {
+			if (this.inviteSyncRetryTimer) {
+				return;
+			}
+			this.inviteSyncRetryTimer = setTimeout(() => {
+				this.inviteSyncRetryTimer = null;
 				this.waitForInviteSyncTicket().catch((retryErr) => console.error(retryErr));
 			}, delay);
 		});
@@ -520,7 +553,7 @@ export class RabbitMqService extends IMService {
 		this.inviteSyncTicket = null;
 		this.waitingForInviteSyncTicket = true;
 
-		return new Promise<void>((resolve) => {
+		this.inviteSyncWaitPromise = new Promise<void>((resolve) => {
 			this.channelInviteSync.consume(
 				this.qNameInviteSync,
 				(msg) => {
@@ -531,15 +564,27 @@ export class RabbitMqService extends IMService {
 					this.waitingForInviteSyncTicket = false;
 					this.inviteSyncTicket = msg;
 					this.inviteSyncRetry = 0;
+					this.clearInviteSyncRetryTimer();
 					resolve();
 				},
 				{ noAck: false }
 			);
 		});
+
+		try {
+			await this.inviteSyncWaitPromise;
+		} finally {
+			if (!this.waitingForInviteSyncTicket) {
+				this.inviteSyncWaitPromise = null;
+			}
+		}
 	}
 
 	public async endInviteSync() {
 		if (!this.channelInviteSync) {
+			this.inviteSyncTicket = null;
+			this.waitingForInviteSyncTicket = false;
+			this.inviteSyncWaitPromise = null;
 			return;
 		}
 
@@ -547,10 +592,13 @@ export class RabbitMqService extends IMService {
 			this.channelInviteSync.nack(this.inviteSyncTicket, false, true);
 		}
 
+		this.closingInviteSyncChannel = true;
 		await this.channelInviteSync.close();
 		this.channelInviteSync = null;
 		this.inviteSyncTicket = null;
 		this.waitingForInviteSyncTicket = false;
+		this.inviteSyncWaitPromise = null;
+		this.clearInviteSyncRetryTimer();
 	}
 
 	public async sendToManager(message: { id: string; [x: string]: any }, isResend: boolean = false) {

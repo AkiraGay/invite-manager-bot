@@ -100,6 +100,14 @@ export interface ClientServiceObject {
 	management: ManagementService;
 }
 
+function shouldStartReadyBootstrap(hasStarted: boolean, readyBootstrapInProgress: boolean): boolean {
+	return !hasStarted && !readyBootstrapInProgress;
+}
+
+export const __test__ = {
+	shouldStartReadyBootstrap
+};
+
 export class IMClient extends Client {
 	public version: string;
 	public build: GitInfo;
@@ -137,6 +145,7 @@ export class IMClient extends Client {
 	public startedAt: Moment;
 	public gatewayConnected: boolean;
 	public activityInterval: NodeJS.Timeout;
+	private readyBootstrapPromise: Promise<void> | null = null;
 	private invalidSessionCount: number = 0;
 	private lastInvalidSessionAt: number = 0;
 	private readonly baseReconnectDelay?: (lastDelay: number, attempts: number) => number;
@@ -284,113 +293,125 @@ export class IMClient extends Client {
 	private async onClientReady(): Promise<void> {
 		this.invalidSessionCount = 0;
 		this.lastInvalidSessionAt = 0;
-		if (this.hasStarted) {
+		if (!shouldStartReadyBootstrap(this.hasStarted, !!this.readyBootstrapPromise)) {
+			if (this.readyBootstrapPromise) {
+				await this.readyBootstrapPromise;
+				return;
+			}
 			console.error('BOT HAS ALREADY STARTED, IGNORING EXTRA READY EVENT');
 			return;
 		}
 
-		// This is for convenience, the services could also subscribe to 'ready' event on client
-		await Promise.all(Object.values(this.service).map((s) => s.onClientReady()));
+		this.readyBootstrapPromise = (async () => {
+			// This is for convenience, the services could also subscribe to 'ready' event on client
+			await Promise.all(Object.values(this.service).map((s) => s.onClientReady()));
 
-		this.hasStarted = true;
-		this.startedAt = moment();
+			this.hasStarted = true;
+			this.startedAt = moment();
 
-		const set = await this.db.getBotSettings(this.user.id);
-		this.settings = set ? set.value : { ...botDefaultSettings };
+			const set = await this.db.getBotSettings(this.user.id);
+			this.settings = set ? set.value : { ...botDefaultSettings };
 
-		console.log(chalk.green(`Client ready! Serving ${chalk.blue(this.guilds.size)} guilds.`));
+			console.log(chalk.green(`Client ready! Serving ${chalk.blue(this.guilds.size)} guilds.`));
 
-		// Init all caches
-		await Promise.all(Object.values(this.cache).map((c) => c.init()));
+			// Init all caches
+			await Promise.all(Object.values(this.cache).map((c) => c.init()));
 
-		// Insert guilds into db
-		await this.db.saveGuilds(
-			this.guilds.map((g): Partial<DbGuild> => ({
-				id: g.id,
-				name: g.name,
-				icon: g.iconURL,
-				memberCount: g.memberCount,
-				deletedAt: null,
-				banReason: null
-			}))
-		);
+			// Insert guilds into db
+			await this.db.saveGuilds(
+				this.guilds.map((g): Partial<DbGuild> => ({
+					id: g.id,
+					name: g.name,
+					icon: g.iconURL,
+					memberCount: g.memberCount,
+					deletedAt: null,
+					banReason: null
+				}))
+			);
 
-		const bannedGuilds = await this.db.getBannedGuilds(this.guilds.map((g) => g.id));
+			const bannedGuilds = await this.db.getBannedGuilds(this.guilds.map((g) => g.id));
 
-		// Do some checks for all guilds
-		this.guilds.forEach(async (guild) => {
-			const bannedGuild = bannedGuilds.find((g) => g.id === guild.id);
+			// Do some checks for all guilds
+			this.guilds.forEach(async (guild) => {
+				const bannedGuild = bannedGuilds.find((g) => g.id === guild.id);
 
-			// Check if the guild was banned
-			if (bannedGuild) {
-				const dmChannel = await this.getDMChannel(guild.ownerID);
-				await dmChannel
-					.createMessage(
-						`Hi! Thanks for inviting me to your server \`${guild.name}\`!\n\n` +
-							'It looks like this guild was banned from using the InviteManager bot.\n' +
-							'If you believe this was a mistake please contact staff on our support server.\n\n' +
-							`${this.config.bot.links.support}\n\n` +
-							'I will be leaving your server now, thanks for having me!'
-					)
-					.catch(() => {});
-				await guild.leave();
-				return;
-			}
+				// Check if the guild was banned
+				if (bannedGuild) {
+					const dmChannel = await this.getDMChannel(guild.ownerID);
+					await dmChannel
+						.createMessage(
+							`Hi! Thanks for inviting me to your server \`${guild.name}\`!\n\n` +
+								'It looks like this guild was banned from using the InviteManager bot.\n' +
+								'If you believe this was a mistake please contact staff on our support server.\n\n' +
+								`${this.config.bot.links.support}\n\n` +
+								'I will be leaving your server now, thanks for having me!'
+						)
+						.catch(() => {});
+					await guild.leave();
+					return;
+				}
 
-			switch (this.type) {
-				case BotType.regular:
-					if (guild.members.has(this.config.bot.ids.pro)) {
-						// Otherwise disable the guild if the pro bot is in it
-						this.disabledGuilds.add(guild.id);
-					}
-					break;
-
-				case BotType.pro:
-					// If this is the pro bot then leave any guilds that aren't pro
-					let premium = await this.cache.premium._get(guild.id);
-
-					if (!premium) {
-						// Let's try and see if this guild had pro before, and if maybe
-						// the member renewed it, but it didn't update.
-						const oldPremium = await this.db.getPremiumSubscriptionGuildForGuild(guild.id, false);
-						if (oldPremium) {
-							await this.premium.checkPatreon(oldPremium.memberId);
-							premium = await this.cache.premium._get(guild.id);
+				switch (this.type) {
+					case BotType.regular:
+						if (guild.members.has(this.config.bot.ids.pro)) {
+							// Otherwise disable the guild if the pro bot is in it
+							this.disabledGuilds.add(guild.id);
 						}
+						break;
+
+					case BotType.pro:
+						// If this is the pro bot then leave any guilds that aren't pro
+						let premium = await this.cache.premium._get(guild.id);
 
 						if (!premium) {
-							const dmChannel = await this.getDMChannel(guild.ownerID);
-							await dmChannel
-								.createMessage(
-									'Hi!' +
-										`Thanks for inviting me to your server \`${guild.name}\`!\n\n` +
-										'I am the pro version of InviteManager, and only available to people ' +
-										'that support me on Patreon with the pro tier.\n\n' +
-										'To purchase the pro tier visit https://www.patreon.com/invitemanager\n\n' +
-										'If you purchased premium run `!premium check` and then `!premium activate` in the server\n\n' +
-										'I will be leaving your server soon, thanks for having me!'
-								)
-								.catch(() => {});
-							const onTimeout = async () => {
-								// Check one last time before leaving
-								if (await this.cache.premium._get(guild.id)) {
-									return;
-								}
+							// Let's try and see if this guild had pro before, and if maybe
+							// the member renewed it, but it didn't update.
+							const oldPremium = await this.db.getPremiumSubscriptionGuildForGuild(guild.id, false);
+							if (oldPremium) {
+								await this.premium.checkPatreon(oldPremium.memberId);
+								premium = await this.cache.premium._get(guild.id);
+							}
 
-								await guild.leave();
-							};
-							setTimeout(onTimeout, 3 * 60 * 1000);
+							if (!premium) {
+								const dmChannel = await this.getDMChannel(guild.ownerID);
+								await dmChannel
+									.createMessage(
+										'Hi!' +
+											`Thanks for inviting me to your server \`${guild.name}\`!\n\n` +
+											'I am the pro version of InviteManager, and only available to people ' +
+											'that support me on Patreon with the pro tier.\n\n' +
+											'To purchase the pro tier visit https://www.patreon.com/invitemanager\n\n' +
+											'If you purchased premium run `!premium check` and then `!premium activate` in the server\n\n' +
+											'I will be leaving your server soon, thanks for having me!'
+									)
+									.catch(() => {});
+								const onTimeout = async () => {
+									// Check one last time before leaving
+									if (await this.cache.premium._get(guild.id)) {
+										return;
+									}
+
+									await guild.leave();
+								};
+								setTimeout(onTimeout, 3 * 60 * 1000);
+							}
 						}
-					}
-					break;
+						break;
 
-				default:
-					break;
-			}
-		});
+					default:
+						break;
+				}
+			});
 
-		await this.setActivity();
-		this.activityInterval = setInterval(() => this.setActivity(), 1 * 60 * 1000);
+			await this.setActivity();
+			this.activityInterval = setInterval(() => this.setActivity(), 1 * 60 * 1000);
+		})();
+
+		try {
+			await this.readyBootstrapPromise;
+		} finally {
+			this.readyBootstrapPromise = null;
+		}
 	}
 
 	public serviceStartupDone(service: IMService) {

@@ -298,6 +298,7 @@ export class TrackingService extends IMService {
 		this.inviteSyncState.activeWorkers++;
 
 		const run = async () => {
+			await this.client.rabbitmq.waitForInviteSyncTicket();
 			const guild = this.inviteSyncQueue.shift();
 
 			if (!guild) {
