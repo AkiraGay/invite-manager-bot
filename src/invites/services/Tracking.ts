@@ -81,6 +81,10 @@ const INVITE_CREATE = 40;
 const INVITE_CODES_BATCH_SIZE_DEFAULT = 250;
 const JOIN_EXACT_MATCH_CODE_DB_LIMIT = 32;
 
+function shouldAcquireInviteSyncLease(queueLength: number): boolean {
+	return queueLength > 0;
+}
+
 function splitInviteCodeBatches<T>(items: T[], batchSize: number): T[][] {
 	if (items.length === 0) {
 		return [];
@@ -142,7 +146,8 @@ function isJoinExactMatchCodeTooLongError(error: unknown): boolean {
 export const __test__ = {
 	buildInviteCodesToSave,
 	splitInviteCodeBatches,
-	isJoinExactMatchCodeTooLongError
+	isJoinExactMatchCodeTooLongError,
+	shouldAcquireInviteSyncLease
 };
 
 export class TrackingService extends IMService {
@@ -298,6 +303,11 @@ export class TrackingService extends IMService {
 		this.inviteSyncState.activeWorkers++;
 
 		const run = async () => {
+			if (!shouldAcquireInviteSyncLease(this.inviteSyncQueue.length)) {
+				this.inviteSyncState.activeWorkers--;
+				return;
+			}
+
 			await this.client.rabbitmq.waitForInviteSyncTicket();
 			const guild = this.inviteSyncQueue.shift();
 

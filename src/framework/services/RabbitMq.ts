@@ -320,13 +320,13 @@ export class RabbitMqService extends IMService {
 		// Return a promise that resolves when we aquire a start ticket (a rabbitmq message)
 		return new Promise<void>((resolve) => {
 			// Start listening on the queue for one message (our start ticket)
-			this.channelStartup.consume(
-				this.qNameStartup,
-				(msg) => {
-					console.log(chalk.green(`Aquired start ticket!`));
+				this.channelStartup.consume(
+					this.qNameStartup,
+					(msg) => {
+						console.log(chalk.green(`Acquired start ticket!`));
 
-					this.waitingForTicket = false;
-					this.startupRetry = 0;
+						this.waitingForTicket = false;
+						this.startupRetry = 0;
 
 					// Save the ticket so we can return it to the queue when our startup is done
 					this.startTicket = msg;
