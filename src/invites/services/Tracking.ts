@@ -217,6 +217,8 @@ export class TrackingService extends IMService {
 		await this.client.rabbitmq.ensureInviteSyncTickets();
 		// No log for invite sync ticket waiting to reduce shard log spam
 		await this.client.rabbitmq.waitForInviteSyncTicket();
+		// Release the startup/connect ticket once this shard has entered the invite-sync phase.
+		await this.client.rabbitmq.endStartup().catch((err) => console.error(err));
 
 		this.inviteSyncQueue = allGuilds;
 		this.initInviteSyncState(inviteSyncConfig);
