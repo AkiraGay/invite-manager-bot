@@ -40,7 +40,7 @@
 		"maxDelayMs": 8000,
 		"minParallel": 1,
 		"maxParallel": 5,
-		"globalMaxConcurrent": 0,
+		"globalMaxConcurrent": 10,
 		"ticketShardId": 0,
 		"inviteCodeBatchDelayMs": 200,
 		"preloadCap": 0
