@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import chalk from '../../util/chalk';
 import {
 	AnyChannel,
@@ -76,13 +77,36 @@ interface InviteSyncResult {
 	hadError: boolean;
 }
 
+interface AuditNoMatchCacheEntry {
+	snapshotHash: string;
+	suppressUntil: number;
+	lastSuppressedLogAt: number;
+}
+
 const GUILDS_IN_PARALLEL = 5;
 const INVITE_CREATE = 40;
 const INVITE_CODES_BATCH_SIZE_DEFAULT = 250;
 const JOIN_EXACT_MATCH_CODE_DB_LIMIT = 32;
+const AUDIT_NO_MATCH_SUPPRESS_TTL_MS = 30000;
+const AUDIT_NO_MATCH_CACHE_MAX_SIZE = 2048;
 
 function shouldAcquireInviteSyncLease(queueLength: number): boolean {
 	return queueLength > 0;
+}
+
+function buildAuditNoMatchSnapshotHash(
+	oldInvs: { [key: string]: { uses: number; maxUses: number } },
+	newInvs: { [key: string]: { uses: number; maxUses: number } }
+): string {
+	return createHash('sha1').update(JSON.stringify(oldInvs)).update('|').update(JSON.stringify(newInvs)).digest('hex');
+}
+
+function shouldSuppressAuditNoMatch(
+	entry: AuditNoMatchCacheEntry | undefined,
+	snapshotHash: string,
+	now: number
+): boolean {
+	return !!entry && entry.snapshotHash === snapshotHash && entry.suppressUntil > now;
 }
 
 function splitInviteCodeBatches<T>(items: T[], batchSize: number): T[][] {
@@ -147,7 +171,9 @@ export const __test__ = {
 	buildInviteCodesToSave,
 	splitInviteCodeBatches,
 	isJoinExactMatchCodeTooLongError,
-	shouldAcquireInviteSyncLease
+	shouldAcquireInviteSyncLease,
+	buildAuditNoMatchSnapshotHash,
+	shouldSuppressAuditNoMatch
 };
 
 export class TrackingService extends IMService {
@@ -160,6 +186,7 @@ export class TrackingService extends IMService {
 		[guildId: string]: { [code: string]: { uses: number; maxUses: number } };
 	} = {};
 	private inviteStoreUpdate: { [guildId: string]: number } = {};
+	private auditNoMatchCache: Map<string, AuditNoMatchCacheEntry> = new Map();
 
 	public async init() {
 		this.client.on('inviteCreate', this.onInviteCreate.bind(this));
@@ -677,9 +704,10 @@ export class TrackingService extends IMService {
 		const lastUpdate = this.inviteStoreUpdate[guild.id];
 		const newInvs = this.getInviteCounts(invs);
 		const oldInvs = this.inviteStore[guild.id];
+		const now = Date.now();
 
 		this.inviteStore[guild.id] = newInvs;
-		this.inviteStoreUpdate[guild.id] = Date.now();
+		this.inviteStoreUpdate[guild.id] = now;
 
 		if (!oldInvs) {
 			console.error('Invite cache for guild ' + guild.id + ' was undefined when adding member ' + member.id);
@@ -688,39 +716,57 @@ export class TrackingService extends IMService {
 
 		let exactMatchCode: string = null;
 		let inviteCodesUsed = this.compareInvites(oldInvs, newInvs);
+		const canUseAuditLogs = guild.members.get(this.client.user.id).permissions.has(GuildPermission.VIEW_AUDIT_LOGS);
+		const auditSnapshotHash =
+			inviteCodesUsed.length === 0 ? buildAuditNoMatchSnapshotHash(oldInvs, newInvs) : null;
+		let auditNoMatchSuppressed = false;
 
-		if (
-			inviteCodesUsed.length === 0 &&
-			guild.members.get(this.client.user.id).permissions.has(GuildPermission.VIEW_AUDIT_LOGS)
-		) {
-			console.log(`USING AUDIT LOGS FOR ${member.id} IN ${guild.id}`);
+		if (inviteCodesUsed.length === 0 && canUseAuditLogs) {
+			const auditNoMatchEntry =
+				auditSnapshotHash && shouldSuppressAuditNoMatch(this.auditNoMatchCache.get(guild.id), auditSnapshotHash, now)
+					? this.auditNoMatchCache.get(guild.id)
+					: undefined;
 
-			const logs = (await guild
-				.getAuditLogs(50, undefined, INVITE_CREATE)
-				.catch((): null => null)) as GuildAuditLogOnlyInvites;
-			if (logs && logs.entries.length) {
-				const createdCodes = logs.entries
-					.filter((e) => deconstruct(e.id) > lastUpdate && newInvs[e.after.code] === undefined)
-					.map((e) => {
-						const auditGuild = e.guild && 'channels' in e.guild ? (e.guild as Guild) : null;
-						const auditChannel = auditGuild ? auditGuild.channels.get(e.after.channel_id) : null;
-						return {
-							code: e.after.code,
-							channel: {
-								id: e.after.channel_id,
-								name: auditChannel ? auditChannel.name : 'unknown'
-							},
-							guild: e.guild,
-							inviter: e.user,
-							uses: (e.after.uses as number) + 1,
-							maxUses: e.after.max_uses,
-							maxAge: e.after.max_age,
-							temporary: e.after.temporary,
-							createdAt: deconstruct(e.id)
-						};
-					});
-				inviteCodesUsed = inviteCodesUsed.concat(createdCodes.map((c) => c.code) as string[]);
-				invs = invs.concat(createdCodes as any);
+			if (auditNoMatchEntry) {
+				auditNoMatchSuppressed = true;
+				if (
+					auditNoMatchEntry.lastSuppressedLogAt === 0 ||
+					now - auditNoMatchEntry.lastSuppressedLogAt >= AUDIT_NO_MATCH_SUPPRESS_TTL_MS
+				) {
+					console.log(`AUDIT NO-MATCH SUPPRESSED FOR GUILD ${guild.id}`);
+					auditNoMatchEntry.lastSuppressedLogAt = now;
+					this.auditNoMatchCache.set(guild.id, auditNoMatchEntry);
+				}
+			} else {
+				console.log(`USING AUDIT LOGS FOR ${member.id} IN ${guild.id}`);
+
+				const logs = (await guild
+					.getAuditLogs(50, undefined, INVITE_CREATE)
+					.catch((): null => null)) as GuildAuditLogOnlyInvites;
+				if (logs && logs.entries.length) {
+					const createdCodes = logs.entries
+						.filter((e) => deconstruct(e.id) > lastUpdate && newInvs[e.after.code] === undefined)
+						.map((e) => {
+							const auditGuild = e.guild && 'channels' in e.guild ? (e.guild as Guild) : null;
+							const auditChannel = auditGuild ? auditGuild.channels.get(e.after.channel_id) : null;
+							return {
+								code: e.after.code,
+								channel: {
+									id: e.after.channel_id,
+									name: auditChannel ? auditChannel.name : 'unknown'
+								},
+								guild: e.guild,
+								inviter: e.user,
+								uses: (e.after.uses as number) + 1,
+								maxUses: e.after.max_uses,
+								maxAge: e.after.max_age,
+								temporary: e.after.temporary,
+								createdAt: deconstruct(e.id)
+							};
+						});
+					inviteCodesUsed = inviteCodesUsed.concat(createdCodes.map((c) => c.code) as string[]);
+					invs = invs.concat(createdCodes as any);
+				}
 			}
 		}
 
@@ -744,12 +790,37 @@ export class TrackingService extends IMService {
 			}
 		}
 
+		if (inviteCodesUsed.length > 0 || isVanity) {
+			this.auditNoMatchCache.delete(guild.id);
+		}
+
 		if (inviteCodesUsed.length === 0 && !isVanity) {
-			console.error(
-				`NO USED INVITE CODE FOUND: g:${guild.id} | m: ${member.id} ` +
-					`| t:${member.joinedAt} | invs: ${JSON.stringify(newInvs)} ` +
-					`| oldInvs: ${JSON.stringify(oldInvs)}`
-			);
+			if (canUseAuditLogs && auditSnapshotHash) {
+				if (!auditNoMatchSuppressed) {
+					if (!this.auditNoMatchCache.has(guild.id) && this.auditNoMatchCache.size >= AUDIT_NO_MATCH_CACHE_MAX_SIZE) {
+						const oldestGuildId = this.auditNoMatchCache.keys().next().value;
+						if (oldestGuildId) {
+							this.auditNoMatchCache.delete(oldestGuildId);
+						}
+					}
+					this.auditNoMatchCache.set(guild.id, {
+						snapshotHash: auditSnapshotHash,
+						suppressUntil: now + AUDIT_NO_MATCH_SUPPRESS_TTL_MS,
+						lastSuppressedLogAt: 0
+					});
+					console.error(
+						`NO USED INVITE CODE FOUND: g:${guild.id} | m: ${member.id} ` +
+							`| t:${member.joinedAt} | invs: ${JSON.stringify(newInvs)} ` +
+							`| oldInvs: ${JSON.stringify(oldInvs)}`
+					);
+				}
+			} else {
+				console.error(
+					`NO USED INVITE CODE FOUND: g:${guild.id} | m: ${member.id} ` +
+						`| t:${member.joinedAt} | invs: ${JSON.stringify(newInvs)} ` +
+						`| oldInvs: ${JSON.stringify(oldInvs)}`
+				);
+			}
 		}
 
 		if (inviteCodesUsed.length === 1) {
