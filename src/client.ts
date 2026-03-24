@@ -688,7 +688,7 @@ export class IMClient extends Client {
 		this.gatewayConnected = false;
 		await this.rabbitmq.sendStatusToManager(err);
 
-		if (err) {
+		if (err && !this.isExpectedGatewayResetError(err)) {
 			console.error(err);
 		}
 	}
@@ -708,6 +708,9 @@ export class IMClient extends Client {
 	private async onError(error: Error) {
 		const message = error instanceof Error ? error.message : String(error);
 		if (message.includes('Invalid channel ID: undefined')) {
+			return;
+		}
+		if (this.isExpectedGatewayResetError(error)) {
 			return;
 		}
 		console.error('DISCORD ERROR:', error);
@@ -761,5 +764,14 @@ export class IMClient extends Client {
 		const step = this.invalidSessionCount - 1;
 		const delay = 5000 * Math.pow(2, step - 1);
 		return Math.min(120000, Math.max(0, Math.round(delay)));
+	}
+
+	private isExpectedGatewayResetError(error: Error | null | undefined): boolean {
+		if (!error) {
+			return false;
+		}
+		const message = error instanceof Error ? error.message : String(error);
+		const code = typeof (error as any).code === 'number' ? Number((error as any).code) : null;
+		return message === 'Connection reset by peer' && code === 1006;
 	}
 }
