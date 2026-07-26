@@ -41,6 +41,7 @@ export class RabbitMqService extends IMService {
 	private channelStartup: Channel;
 	private startTicket: MQMessage;
 	private waitingForTicket: boolean;
+	private startupConsumerTag: string | null = null;
 	private startupRetry: number = 0;
 	private qNameStartupDone: string;
 	private channelStartupDone: Channel;
@@ -49,6 +50,8 @@ export class RabbitMqService extends IMService {
 	private startupDoneSatisfied: boolean;
 	private startupDoneRetry: number = 0;
 	private startupDoneRetryTimer: NodeJS.Timeout | null = null;
+	private startupDoneWaitPromise: Promise<void> | null = null;
+	private startupDoneWaitResolve: (() => void) | null = null;
 
 	private qNameInviteSync: string;
 	private channelInviteSync: Channel;
@@ -189,11 +192,11 @@ export class RabbitMqService extends IMService {
 				await this.sendToManager(this.msgQueue.pop(), true);
 			}
 
-		await this.channel.prefetch(5);
-		await this.channel.assertQueue(this.qName, { durable: false, autoDelete: true });
-		await this.channel.assertExchange('shards', 'fanout', { durable: true });
-		await this.channel.bindQueue(this.qName, 'shards', '');
-		this.channel.consume(this.qName, (msg) => this.onShardCommand(msg), { noAck: false });
+			await this.channel.prefetch(5);
+			await this.channel.assertQueue(this.qName, { durable: false, autoDelete: true });
+			await this.channel.assertExchange('shards', 'fanout', { durable: true });
+			await this.channel.bindQueue(this.qName, 'shards', '');
+			this.channel.consume(this.qName, (msg) => this.onShardCommand(msg), { noAck: false });
 
 			this.channelRetry = 0;
 		} catch (err) {
@@ -266,6 +269,30 @@ export class RabbitMqService extends IMService {
 			this.inviteSyncRetryTimer = null;
 		}
 	}
+	private async waitForChannelAction<T>(
+		action: Promise<T>,
+		timeoutMs: number,
+		timeoutMessage: string
+	): Promise<T | null> {
+		let timeout: NodeJS.Timeout | null = null;
+		const observed = action.catch((err): null => {
+			console.error(err);
+			return null;
+		});
+		const result = await Promise.race([
+			observed,
+			new Promise<null>((resolve) => {
+				timeout = setTimeout(() => resolve(null), timeoutMs);
+			})
+		]);
+		if (timeout) {
+			clearTimeout(timeout);
+		}
+		if (result === null) {
+			console.error(timeoutMessage);
+		}
+		return result;
+	}
 
 	public async waitForStartupTicket() {
 		const { enabled } = this.getStartupTicketSettings();
@@ -318,9 +345,10 @@ export class RabbitMqService extends IMService {
 		this.waitingForTicket = true;
 
 		// Return a promise that resolves when we aquire a start ticket (a rabbitmq message)
-		return new Promise<void>((resolve) => {
+		return new Promise<void>((resolve, reject) => {
 			// Start listening on the queue for one message (our start ticket)
-				this.channelStartup.consume(
+			this.channelStartup
+				.consume(
 					this.qNameStartup,
 					(msg) => {
 						console.log(chalk.green(`Acquired start ticket!`));
@@ -328,16 +356,35 @@ export class RabbitMqService extends IMService {
 						this.waitingForTicket = false;
 						this.startupRetry = 0;
 
-					// Save the ticket so we can return it to the queue when our startup is done
-					this.startTicket = msg;
-					resolve();
-				},
-				{ noAck: false, priority: this.client.hasStarted ? 1 : 0 }
-			);
+						// Save the ticket so we can return it to the queue when our startup is done
+						this.startTicket = msg;
+						resolve();
+					},
+					{ noAck: false, priority: this.client.hasStarted ? 1 : 0 }
+				)
+				.then((reply) => {
+					this.startupConsumerTag = reply.consumerTag;
+				})
+				.catch(reject);
 		});
 	}
 	public async waitForStartupTicketsDone() {
 		if (!shouldWaitForStartupDone(this.client.hasStarted, this.startupDoneSatisfied)) {
+			return;
+		}
+		if (!this.startupDoneWaitPromise) {
+			this.startupDoneWaitPromise = new Promise<void>((resolve) => {
+				this.startupDoneWaitResolve = resolve;
+			});
+		}
+
+		await this.openStartupDoneChannel();
+		return this.startupDoneWaitPromise;
+	}
+
+	private async openStartupDoneChannel() {
+		if (!shouldWaitForStartupDone(this.client.hasStarted, this.startupDoneSatisfied)) {
+			this.resolveStartupDoneWait();
 			return;
 		}
 		if (this.waitingForStartupDone || this.channelStartupDone) {
@@ -348,10 +395,12 @@ export class RabbitMqService extends IMService {
 			!enabled &&
 			(this.client.type === BotType.custom || this.client.type === BotType.pro || this.client.type === BotType.regular)
 		) {
+			this.resolveStartupDoneWait();
 			return;
 		}
 		if (this.client.flags.includes('--no-rabbitmq')) {
 			console.log(chalk.yellow('Skipping startup done ticket (--no-rabbitmq).'));
+			this.resolveStartupDoneWait();
 			return;
 		}
 		if (!this.conn) {
@@ -360,9 +409,13 @@ export class RabbitMqService extends IMService {
 		}
 
 		this.qNameStartupDone = `shard-${this.client.instance}-start-done`;
-		this.channelStartupDone = await this.conn.createChannel();
-		this.channelStartupDone.on('close', async (err) => {
+		const channel = await this.conn.createChannel();
+		this.channelStartupDone = channel;
+		channel.on('close', async (err) => {
 			this.waitingForStartupDone = false;
+			if (this.channelStartupDone === channel) {
+				this.channelStartupDone = null;
+			}
 
 			if (this.startupDoneTicket || !shouldWaitForStartupDone(this.client.hasStarted, this.startupDoneSatisfied)) {
 				this.clearStartupDoneRetryTimer();
@@ -385,55 +438,82 @@ export class RabbitMqService extends IMService {
 				if (!shouldWaitForStartupDone(this.client.hasStarted, this.startupDoneSatisfied)) {
 					return;
 				}
-				this.waitForStartupTicketsDone().catch((retryErr) => console.error(retryErr));
+				this.openStartupDoneChannel().catch((retryErr) => console.error(retryErr));
 			}, delay);
 		});
 
-		await this.channelStartupDone.prefetch(1);
-		await this.channelStartupDone.assertQueue(this.qNameStartupDone, { durable: true, autoDelete: false });
+		await channel.prefetch(1);
+		await channel.assertQueue(this.qNameStartupDone, { durable: true, autoDelete: false });
 
 		this.startupDoneTicket = null;
 		this.waitingForStartupDone = true;
 
-		return new Promise<void>((resolve) => {
-			this.channelStartupDone.consume(
-				this.qNameStartupDone,
-				async (msg) => {
-					if (!msg) {
-						return;
-					}
-					console.log(chalk.green('Acquired startup done ticket!'));
-					this.waitingForStartupDone = false;
-					this.clearStartupDoneRetryTimer();
-					this.startupDoneSatisfied = true;
-					this.startupDoneTicket = msg;
-					this.startupDoneRetry = 0;
-					this.channelStartupDone.ack(msg);
-					await this.channelStartupDone.close();
-					this.channelStartupDone = null;
-					this.startupDoneTicket = null;
-					resolve();
-				},
-				{ noAck: false }
-			);
-		});
+		await channel.consume(
+			this.qNameStartupDone,
+			async (msg) => {
+				if (!msg) {
+					return;
+				}
+				console.log(chalk.green('Acquired startup done ticket!'));
+				this.waitingForStartupDone = false;
+				this.clearStartupDoneRetryTimer();
+				this.startupDoneSatisfied = true;
+				this.startupDoneTicket = msg;
+				this.startupDoneRetry = 0;
+				channel.ack(msg);
+				this.startupDoneTicket = null;
+				this.resolveStartupDoneWait();
+				channel
+					.close()
+					.catch((err) => console.error(err))
+					.finally(() => {
+						if (this.channelStartupDone === channel) {
+							this.channelStartupDone = null;
+						}
+					});
+			},
+			{ noAck: false }
+		);
+	}
+
+	private resolveStartupDoneWait() {
+		const resolve = this.startupDoneWaitResolve;
+		this.startupDoneWaitResolve = null;
+		this.startupDoneWaitPromise = null;
+		if (resolve) {
+			resolve();
+		}
 	}
 	public async endStartup() {
 		if (!this.channelStartup) {
 			return;
 		}
 
+		const channel = this.channelStartup;
+		if (this.startupConsumerTag) {
+			await this.waitForChannelAction(
+				channel.cancel(this.startupConsumerTag),
+				5000,
+				'Startup ticket consumer cancel timed out; continuing startup handoff.'
+			);
+			this.startupConsumerTag = null;
+		}
+
 		if (this.startTicket) {
 			const { requeue } = this.getStartupTicketSettings();
 			if (requeue) {
-				this.channelStartup.nack(this.startTicket, false, true);
+				channel.nack(this.startTicket, false, true);
 			} else {
-				this.channelStartup.ack(this.startTicket);
+				channel.ack(this.startTicket);
 			}
 		}
 
 		// Close the channel because we don't want another ticket
-		await this.channelStartup.close();
+		await this.waitForChannelAction(
+			channel.close(),
+			5000,
+			'Startup ticket channel close timed out; continuing invite sync.'
+		);
 		this.channelStartup = null;
 
 		this.startTicket = null;
@@ -535,7 +615,9 @@ export class RabbitMqService extends IMService {
 				console.error(err);
 			}
 
-			console.error(hadTicket ? 'Lost invite sync ticket lease, reacquiring' : 'Could not acquire invite sync ticket, retrying');
+			console.error(
+				hadTicket ? 'Lost invite sync ticket lease, reacquiring' : 'Could not acquire invite sync ticket, retrying'
+			);
 			const delay = this.getReconnectDelayMs(this.inviteSyncRetry, 1000, 30000);
 			this.inviteSyncRetry++;
 			if (this.inviteSyncRetryTimer) {
@@ -553,23 +635,21 @@ export class RabbitMqService extends IMService {
 		this.inviteSyncTicket = null;
 		this.waitingForInviteSyncTicket = true;
 
-		this.inviteSyncWaitPromise = new Promise<void>((resolve) => {
-			this.channelInviteSync.consume(
-				this.qNameInviteSync,
-				(msg) => {
-					if (!msg) {
-						return;
-					}
+		const channel = this.channelInviteSync;
+		this.inviteSyncWaitPromise = (async () => {
+			while (this.channelInviteSync === channel && this.waitingForInviteSyncTicket) {
+				const msg = await channel.get(this.qNameInviteSync, { noAck: false });
+				if (msg) {
 					console.log(chalk.green('Acquired invite sync ticket!'));
 					this.waitingForInviteSyncTicket = false;
 					this.inviteSyncTicket = msg;
 					this.inviteSyncRetry = 0;
 					this.clearInviteSyncRetryTimer();
-					resolve();
-				},
-				{ noAck: false }
-			);
-		});
+					return;
+				}
+				await sleep(1000);
+			}
+		})();
 
 		try {
 			await this.inviteSyncWaitPromise;
@@ -646,6 +726,10 @@ export class RabbitMqService extends IMService {
 			invalidSessionCount: gatewayStatus.invalidSessionCount,
 			invalidSessionBackoffMs: gatewayStatus.invalidSessionBackoffMs,
 			invalidSessionActive: gatewayStatus.invalidSessionActive,
+			startupPhase: this.client.tracking.startupPhase,
+			inviteSyncLeaseHeld: !!this.inviteSyncTicket,
+			waitingForStartupDone: this.waitingForStartupDone,
+			waitingForInviteSyncTicket: this.waitingForInviteSyncTicket,
 			guilds: this.client.guilds.size,
 			error: err ? err.message : null,
 			build: this.client.build,
@@ -949,7 +1033,11 @@ export class RabbitMqService extends IMService {
 	private getTrackingStatus() {
 		return {
 			pendingGuilds: this.client.tracking.pendingGuilds.size,
-			initialPendingGuilds: this.client.tracking.initialPendingGuilds
+			initialPendingGuilds: this.client.tracking.initialPendingGuilds,
+			startupPhase: this.client.tracking.startupPhase,
+			inviteSyncLeaseHeld: !!this.inviteSyncTicket,
+			waitingForStartupDone: this.waitingForStartupDone,
+			waitingForInviteSyncTicket: this.waitingForInviteSyncTicket
 		};
 	}
 	private getMusicStatus() {

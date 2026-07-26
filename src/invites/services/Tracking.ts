@@ -77,6 +77,14 @@ interface InviteSyncResult {
 	hadError: boolean;
 }
 
+type StartupPhase =
+	| 'booting'
+	| 'waiting-startup-done'
+	| 'preloading'
+	| 'waiting-invite-sync-ticket'
+	| 'syncing'
+	| 'ready';
+
 interface AuditNoMatchCacheEntry {
 	snapshotHash: string;
 	suppressUntil: number;
@@ -179,6 +187,7 @@ export const __test__ = {
 export class TrackingService extends IMService {
 	public pendingGuilds: Set<string> = new Set();
 	public initialPendingGuilds: number = 0;
+	public startupPhase: StartupPhase = 'booting';
 
 	private inviteSyncQueue: Guild[] = [];
 	private inviteSyncState: InviteSyncState;
@@ -203,11 +212,16 @@ export class TrackingService extends IMService {
 
 	public async onClientReady() {
 		if (this.client.hasStarted) {
+			this.startupPhase = 'ready';
 			this.startupDone();
 			return;
 		}
 
 		const inviteSyncConfig = this.getInviteSyncConfig();
+		this.startupPhase = 'waiting-startup-done';
+		await this.client.rabbitmq.waitForStartupTicketsDone();
+
+		this.startupPhase = 'preloading';
 		console.log(`Requesting ${chalk.blue(inviteSyncConfig.parallel)} guilds in parallel during startup`);
 
 		// Save all guilds, sort descending by member count
@@ -240,11 +254,13 @@ export class TrackingService extends IMService {
 		);
 
 		this.initialPendingGuilds = allGuilds.length;
-		await this.client.rabbitmq.waitForStartupTicketsDone();
 		await this.client.rabbitmq.ensureInviteSyncTickets();
+		this.startupPhase = 'waiting-invite-sync-ticket';
 		// No log for invite sync ticket waiting to reduce shard log spam
 		await this.client.rabbitmq.waitForInviteSyncTicket();
+		this.startupPhase = 'syncing';
 		// Release the startup/connect ticket once this shard has entered the invite-sync phase.
+		console.log('Invite sync ticket accepted; releasing startup ticket.');
 		await this.client.rabbitmq.endStartup().catch((err) => console.error(err));
 
 		this.inviteSyncQueue = allGuilds;
@@ -257,6 +273,7 @@ export class TrackingService extends IMService {
 		if (this.inviteSyncQueue.length === 0) {
 			this.logInviteSyncSummary();
 			await this.client.rabbitmq.endInviteSync();
+			this.startupPhase = 'ready';
 			this.startupDone();
 			return;
 		}
@@ -323,7 +340,10 @@ export class TrackingService extends IMService {
 			return;
 		}
 
-		while (this.inviteSyncState.activeWorkers < this.inviteSyncState.targetParallel && this.inviteSyncQueue.length > 0) {
+		while (
+			this.inviteSyncState.activeWorkers < this.inviteSyncState.targetParallel &&
+			this.inviteSyncQueue.length > 0
+		) {
 			this.spawnInviteSyncWorker();
 		}
 	}
@@ -375,6 +395,7 @@ export class TrackingService extends IMService {
 				console.log(chalk.green('Loaded all pending guilds!'));
 				this.logInviteSyncSummary();
 				await this.client.rabbitmq.endInviteSync();
+				this.startupPhase = 'ready';
 				this.startupDone();
 				this.inviteSyncState.activeWorkers--;
 				return;
@@ -717,8 +738,7 @@ export class TrackingService extends IMService {
 		let exactMatchCode: string = null;
 		let inviteCodesUsed = this.compareInvites(oldInvs, newInvs);
 		const canUseAuditLogs = guild.members.get(this.client.user.id).permissions.has(GuildPermission.VIEW_AUDIT_LOGS);
-		const auditSnapshotHash =
-			inviteCodesUsed.length === 0 ? buildAuditNoMatchSnapshotHash(oldInvs, newInvs) : null;
+		const auditSnapshotHash = inviteCodesUsed.length === 0 ? buildAuditNoMatchSnapshotHash(oldInvs, newInvs) : null;
 		let auditNoMatchSuppressed = false;
 
 		if (inviteCodesUsed.length === 0 && canUseAuditLogs) {
@@ -1055,17 +1075,17 @@ export class TrackingService extends IMService {
 			}
 		}
 
-			let inviter = guild.members.get(invite.inviter.id);
-			if (!inviter && invite.inviter) {
-				inviter = await guild.getRESTMember(invite.inviter.id).catch(() => null as Member);
-			}
+		let inviter = guild.members.get(invite.inviter.id);
+		if (!inviter && invite.inviter) {
+			inviter = await guild.getRESTMember(invite.inviter.id).catch(() => null as Member);
+		}
 
 		if (inviter) {
 			// Promote the inviter if required
-				let me = guild.members.get(this.client.user.id);
-				if (!me) {
-					me = await guild.getRESTMember(this.client.user.id).catch(() => null as Member);
-				}
+			let me = guild.members.get(this.client.user.id);
+			if (!me) {
+				me = await guild.getRESTMember(this.client.user.id).catch(() => null as Member);
+			}
 
 			if (me) {
 				await this.client.invs.promoteIfQualified(guild, inviter, me, invites.total);
