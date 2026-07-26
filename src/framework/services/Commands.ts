@@ -328,8 +328,7 @@ export class CommandsService extends IMService {
 							);
 							return;
 						}
-					} else if (cmd.strict && member.id !== '216749228087705610') {
-						// todo: bot dev check to always allow
+					} else if (cmd.strict && !this.client.config.bot.bot_devs.includes(member.id)) {
 						// Allow commands that require no roles, if strict is not true
 						await this.client.msg.sendReply(message, t('permissions.adminOnly'));
 						return;

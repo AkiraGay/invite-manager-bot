@@ -31,7 +31,7 @@ export default class extends Command {
 	public async action(message: Message, [code_]: [Command], flags: {}, context: Context): Promise<any> {
 		if (this.args.length < -1) return; // should never trigger
 
-		if (message.author.id !== '79305800157233152') {
+		if (!this.client.config.bot.bot_devs.includes(message.author.id)) {
 			await this.client.msg.sendReply(message, 'This command is restricted.');
 			return;
 		}
