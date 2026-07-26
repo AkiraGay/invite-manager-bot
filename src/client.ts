@@ -319,14 +319,16 @@ export class IMClient extends Client {
 
 			// Insert guilds into db
 			await this.db.saveGuilds(
-				this.guilds.map((g): Partial<DbGuild> => ({
-					id: g.id,
-					name: g.name,
-					icon: g.iconURL,
-					memberCount: g.memberCount,
-					deletedAt: null,
-					banReason: null
-				}))
+				this.guilds.map(
+					(g): Partial<DbGuild> => ({
+						id: g.id,
+						name: g.name,
+						icon: g.iconURL,
+						memberCount: g.memberCount,
+						deletedAt: null,
+						banReason: null
+					})
+				)
 			);
 
 			const bannedGuilds = await this.db.getBannedGuilds(this.guilds.map((g) => g.id));
@@ -537,7 +539,7 @@ export class IMClient extends Client {
 				name: guild.name,
 				icon: guild.iconURL,
 				memberCount: guild.memberCount,
-				banReason: dbGuild.banReason,
+				banReason: dbGuild ? dbGuild.banReason : null,
 				deletedAt: new Date()
 			}
 		]);
@@ -664,12 +666,12 @@ export class IMClient extends Client {
 			this.settings.activityType === 'playing'
 				? 0
 				: this.settings.activityType === 'streaming'
-				? 1
-				: this.settings.activityType === 'listening'
-				? 2
-				: this.settings.activityType === 'watching'
-				? 3
-				: 0;
+					? 1
+					: this.settings.activityType === 'listening'
+						? 2
+						: this.settings.activityType === 'watching'
+							? 3
+							: 0;
 
 		const name = this.settings.activityMessage || `invitemanager.cc!`;
 		const url = this.settings.activityUrl;
